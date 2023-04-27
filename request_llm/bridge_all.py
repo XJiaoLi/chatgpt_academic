@@ -1,22 +1,26 @@
 
 """
-    该文件中主要包含2个函数
+    该文件中主要包含2个函数，是所有LLM的通用接口，它们会继续向下调用更底层的LLM模型，处理多模型并行等细节
 
-    不具备多线程能力的函数：
-    1. predict: 正常对话时使用，具备完备的交互功能，不可多线程
+    不具备多线程能力的函数：正常对话时使用，具备完备的交互功能，不可多线程
+    1. predict(...)
 
-    具备多线程调用能力的函数
-    2. predict_no_ui_long_connection：在实验过程中发现调用predict_no_ui处理长文档时，和openai的连接容易断掉，这个函数用stream的方式解决这个问题，同样支持多线程
+    具备多线程调用能力的函数：在函数插件中被调用，灵活而简洁
+    2. predict_no_ui_long_connection(...)
 """
 import tiktoken
-from functools import wraps, lru_cache
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
+from toolbox import get_conf, trimmed_format_exc
 
 from .bridge_chatgpt import predict_no_ui_long_connection as chatgpt_noui
 from .bridge_chatgpt import predict as chatgpt_ui
 
 from .bridge_chatglm import predict_no_ui_long_connection as chatglm_noui
 from .bridge_chatglm import predict as chatglm_ui
+
+from .bridge_newbing import predict_no_ui_long_connection as newbing_noui
+from .bridge_newbing import predict as newbing_ui
 
 # from .bridge_tgui import predict_no_ui_long_connection as tgui_noui
 # from .bridge_tgui import predict as tgui_ui
@@ -42,18 +46,39 @@ class LazyloadTiktoken(object):
     def decode(self, *args, **kwargs):
         encoder = self.get_encoder(self.model) 
         return encoder.decode(*args, **kwargs)
-    
+
+# Endpoint 重定向
+API_URL_REDIRECT, = get_conf("API_URL_REDIRECT")
+openai_endpoint = "https://api.openai.com/v1/chat/completions"
+api2d_endpoint = "https://openai.api2d.net/v1/chat/completions"
+newbing_endpoint = "wss://sydney.bing.com/sydney/ChatHub"
+# 兼容旧版的配置
+try:
+    API_URL, = get_conf("API_URL")
+    if API_URL != "https://api.openai.com/v1/chat/completions": 
+        openai_endpoint = API_URL
+        print("警告！API_URL配置选项将被弃用，请更换为API_URL_REDIRECT配置")
+except:
+    pass
+# 新版配置
+if openai_endpoint in API_URL_REDIRECT: openai_endpoint = API_URL_REDIRECT[openai_endpoint]
+if api2d_endpoint in API_URL_REDIRECT: api2d_endpoint = API_URL_REDIRECT[api2d_endpoint]
+if newbing_endpoint in API_URL_REDIRECT: newbing_endpoint = API_URL_REDIRECT[newbing_endpoint]
+
+
+# 获取tokenizer
 tokenizer_gpt35 = LazyloadTiktoken("gpt-3.5-turbo")
 tokenizer_gpt4 = LazyloadTiktoken("gpt-4")
 get_token_num_gpt35 = lambda txt: len(tokenizer_gpt35.encode(txt, disallowed_special=()))
 get_token_num_gpt4 = lambda txt: len(tokenizer_gpt4.encode(txt, disallowed_special=()))
+
 
 model_info = {
     # openai
     "gpt-3.5-turbo": {
         "fn_with_ui": chatgpt_ui,
         "fn_without_ui": chatgpt_noui,
-        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "endpoint": openai_endpoint,
         "max_token": 4096,
         "tokenizer": tokenizer_gpt35,
         "token_cnt": get_token_num_gpt35,
@@ -62,7 +87,7 @@ model_info = {
     "gpt-4": {
         "fn_with_ui": chatgpt_ui,
         "fn_without_ui": chatgpt_noui,
-        "endpoint": "https://api.openai.com/v1/chat/completions",
+        "endpoint": openai_endpoint,
         "max_token": 8192,
         "tokenizer": tokenizer_gpt4,
         "token_cnt": get_token_num_gpt4,
@@ -72,7 +97,7 @@ model_info = {
     "api2d-gpt-3.5-turbo": {
         "fn_with_ui": chatgpt_ui,
         "fn_without_ui": chatgpt_noui,
-        "endpoint": "https://openai.api2d.net/v1/chat/completions",
+        "endpoint": api2d_endpoint,
         "max_token": 4096,
         "tokenizer": tokenizer_gpt35,
         "token_cnt": get_token_num_gpt35,
@@ -81,7 +106,7 @@ model_info = {
     "api2d-gpt-4": {
         "fn_with_ui": chatgpt_ui,
         "fn_without_ui": chatgpt_noui,
-        "endpoint": "https://openai.api2d.net/v1/chat/completions",
+        "endpoint": api2d_endpoint,
         "max_token": 8192,
         "tokenizer": tokenizer_gpt4,
         "token_cnt": get_token_num_gpt4,
@@ -96,7 +121,15 @@ model_info = {
         "tokenizer": tokenizer_gpt35,
         "token_cnt": get_token_num_gpt35,
     },
-
+    # newbing
+    "newbing": {
+        "fn_with_ui": newbing_ui,
+        "fn_without_ui": newbing_noui,
+        "endpoint": newbing_endpoint,
+        "max_token": 4096,
+        "tokenizer": tokenizer_gpt35,
+        "token_cnt": get_token_num_gpt35,
+    },
 }
 
 
@@ -108,10 +141,7 @@ def LLM_CATCH_EXCEPTION(f):
         try:
             return f(inputs, llm_kwargs, history, sys_prompt, observe_window, console_slience)
         except Exception as e:
-            from toolbox import get_conf
-            import traceback
-            proxies, = get_conf('proxies')
-            tb_str = '\n```\n' + traceback.format_exc() + '\n```\n'
+            tb_str = '\n```\n' + trimmed_format_exc() + '\n```\n'
             observe_window[0] = tb_str
             return tb_str
     return decorated
@@ -162,7 +192,7 @@ def predict_no_ui_long_connection(inputs, llm_kwargs, history, sys_prompt, obser
 
         def mutex_manager(window_mutex, observe_window):
             while True:
-                time.sleep(0.5)
+                time.sleep(0.25)
                 if not window_mutex[-1]: break
                 # 看门狗（watchdog）
                 for i in range(n_model): 
@@ -190,7 +220,7 @@ def predict_no_ui_long_connection(inputs, llm_kwargs, history, sys_prompt, obser
             return_string_collect.append( f"【{str(models[i])} 说】: <font color=\"{colors[i]}\"> {future.result()} </font>" )
 
         window_mutex[-1] = False # stop mutex thread
-        res = '<br/>\n\n---\n\n'.join(return_string_collect)
+        res = '<br/><br/>\n\n---\n\n'.join(return_string_collect)
         return res
 
 
